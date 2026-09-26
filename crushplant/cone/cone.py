@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from ..audit.ledger import OUTCOME_OK, AuditLedger
+from ..audit.ledger import OUTCOME_OK, OUTCOME_TRIPPED, AuditLedger
 from ..clock import stamp
 from ..config import LineSpec
 from ..errors import InvalidRequest, StateConflict
@@ -30,6 +30,7 @@ class ConeState:
     stopped_at: str
     stopped_reason: str
     cycles: int
+    stalled: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -42,6 +43,7 @@ class ConeState:
             "stopped_at": self.stopped_at,
             "stopped_reason": self.stopped_reason,
             "cycles": self.cycles,
+            "stalled": self.stalled,
         }
 
     @classmethod
@@ -56,6 +58,7 @@ class ConeState:
             stopped_at=str(raw.get("stopped_at", "")),
             stopped_reason=str(raw.get("stopped_reason", "")),
             cycles=int(raw.get("cycles", 0)),
+            stalled=bool(raw.get("stalled", False)),
         )
 
 
@@ -97,6 +100,7 @@ class ConeCrusher:
         state = self.state()
         if state.running:
             raise StateConflict("the cone is already running", unit=self.unit, since=state.started_at)
+        self._calibration.require(moment)
         updated = ConeState(
             unit=self.unit,
             running=True,
@@ -107,6 +111,7 @@ class ConeCrusher:
             stopped_at=state.stopped_at,
             stopped_reason="",
             cycles=state.cycles + 1,
+            stalled=False,
         )
         self._write(updated, moment)
         self._ledger.record(
@@ -155,6 +160,7 @@ class ConeCrusher:
         if not state.running:
             raise StateConflict("the cone is not running", unit=self.unit)
         current = judge(f"{self.unit}.cone", float(amps), self.current_limit, moment)
+        stall = judge(f"{self.unit}.cone", float(amps), self.stall_limit, moment)
         load_pct = crusher_load_pct(amps, self._spec.cone_rated_amps)
         updated = ConeState(
             **{
@@ -163,9 +169,39 @@ class ConeCrusher:
                 "load_pct": load_pct,
             }
         )
+        if not stall.ok():
+            reason = f"cone stall: {round(float(amps), 3)} A above {self.stall_limit.high} A"
+            updated = ConeState(
+                **{
+                    **updated.as_dict(),
+                    "running": False,
+                    "stalled": True,
+                    "stopped_at": stamp(moment),
+                    "stopped_reason": reason,
+                }
+            )
         self._write(updated, moment)
         self._verdicts.record_threshold(self.unit, current, moment, actor, load_pct=load_pct)
-        return {"state": updated.as_dict(), "current": current.as_dict()}
+        self._verdicts.record_threshold(
+            self.unit, stall, moment, actor, load_pct=load_pct, stall_amps=self.stall_limit.high
+        )
+        if not stall.ok():
+            self._ledger.record(
+                self.unit,
+                "cone.stall",
+                OUTCOME_TRIPPED,
+                actor,
+                moment,
+                subject=f"{self.unit}.cone",
+                reason=reason,
+                amps=round(float(amps), 3),
+                stall_amps=self.stall_limit.high,
+            )
+        return {
+            "state": updated.as_dict(),
+            "current": current.as_dict(),
+            "stall": stall.as_dict(),
+        }
 
     def expected_amps(self, tonnes_per_hour: float, moment: datetime) -> float:
         """Ask the calibration what the draw should have been."""
